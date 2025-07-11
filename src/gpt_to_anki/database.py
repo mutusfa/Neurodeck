@@ -1,5 +1,6 @@
 import logging
 from typing import List, Tuple, Optional
+import asyncio
 from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -70,6 +71,18 @@ class CardDatabase:
             LOG.error("Error saving cards: %s", e)
             raise
 
+    async def asave_cards(
+        self,
+        cards: List[dict],
+        context: str,
+        evaluations: Optional[dict] = None,
+    ):
+        """Async version of save_cards"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self.save_cards, cards, context, evaluations
+        )
+
     def load_cards(self, context: str) -> Tuple[List[dict], dict]:
         """Load cards and evaluations for a specific context."""
         try:
@@ -99,6 +112,11 @@ class CardDatabase:
             LOG.error("Error loading cards: %s", e)
             return [], {}
 
+    async def aload_cards(self, context: str) -> Tuple[List[dict], dict]:
+        """Async version of load_cards"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.load_cards, context)
+
     def update_card_evaluation(self, context: str, card_index: int, evaluation: str):
         """Update the evaluation for a specific card."""
         try:
@@ -127,6 +145,15 @@ class CardDatabase:
                     )
         except Exception as e:
             LOG.error("Error updating card evaluation: %s", e)
+
+    async def aupdate_card_evaluation(
+        self, context: str, card_index: int, evaluation: str
+    ):
+        """Async version of update_card_evaluation"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self.update_card_evaluation, context, card_index, evaluation
+        )
 
     def get_contexts(self) -> List[str]:
         """Get all unique contexts (file paths) that have cards."""
