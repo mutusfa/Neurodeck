@@ -1,3 +1,5 @@
+import asyncio
+from collections import Counter
 import logging
 import os
 import uuid
@@ -9,6 +11,7 @@ import gradio as gr
 
 from gpt_to_anki.cards_generator import CardGenerator
 from gpt_to_anki.database import CardDatabase
+from gpt_to_anki.data_objects import Card
 
 LOG = logging.getLogger(__name__)
 
@@ -47,7 +50,7 @@ class AppState:
         self.local_file_path: Optional[str] = None
         self.document_url: Optional[str] = None
         self.document_key: Optional[str] = None
-        self.cards: List[Dict[str, str]] = []
+        self.cards: List[Card] = []
         self.card_generator = CardGenerator()
         self.current_card_index: int = 0
         self.card_evaluations: Dict[int, str] = {}
@@ -58,30 +61,13 @@ class AppState:
         """Reset card-related state"""
         self.cards = []
         self.current_card_index = 0
-        self.card_evaluations = {}
         self.total_cards = 0
 
-    def get_current_card(self) -> Optional[Dict[str, str]]:
+    def get_current_card(self) -> Optional[Card]:
         """Get the current card or None if no cards"""
         if self.cards and 0 <= self.current_card_index < len(self.cards):
             return self.cards[self.current_card_index]
         return None
-
-    def get_card_evaluation(self, card_index: int) -> str:
-        """Get the evaluation state for a card"""
-        return self.card_evaluations.get(card_index, "not_evaluated")
-
-    def set_card_evaluation(self, card_index: int, evaluation: str):
-        """Set the evaluation state for a card"""
-        self.card_evaluations[card_index] = evaluation
-
-    def get_evaluation_counts(self) -> Dict[str, int]:
-        """Get counts of each evaluation type"""
-        counts = {"liked": 0, "disliked": 0, "seen": 0, "not_evaluated": 0}
-        for i in range(len(self.cards)):
-            eval_state = self.get_card_evaluation(i)
-            counts[eval_state] += 1
-        return counts
 
 
 # Initialize global state
@@ -195,14 +181,11 @@ async def process_document(
         )
 
         # Check if cards already exist for this document
-        existing_cards, existing_evaluations = await app_state.db.aload_cards(
-            app_state.document_key
-        )
+        existing_cards = await app_state.db.aload_cards(app_state.document_key)
 
         if existing_cards:
             LOG.info("Loading existing cards from database...")
             app_state.cards = existing_cards
-            app_state.card_evaluations = existing_evaluations
             app_state.current_card_index = 0
             app_state.total_cards = len(existing_cards)
             return (
@@ -212,20 +195,16 @@ async def process_document(
         else:
             LOG.info("Generating new cards...")
             cards_result = await app_state.card_generator.aforward(context=text)
-            qa_cards = cards_result.qa
-            topic = cards_result.topic
 
-            app_state.cards = [
-                {"question": qa[0], "answer": qa[1], "topic": topic} for qa in qa_cards
-            ]
-            app_state.card_evaluations = {}
+            app_state.cards = cards_result.cards
+            for card in app_state.cards:
+                card.context = app_state.document_key
             app_state.current_card_index = 0
             app_state.total_cards = len(app_state.cards)
 
-            # Save new cards to database
-            await app_state.db.asave_cards(
-                app_state.cards, app_state.document_key, app_state.card_evaluations
-            )
+            # Save new cards to database and update the cards list with database IDs
+            cards = await app_state.db.asave_cards(app_state.cards)
+            app_state.cards = cards
 
             return (
                 "✅ Cards generated successfully!",
@@ -246,7 +225,7 @@ def get_card_display() -> CardDisplay:
     if not current_card:
         return CardDisplay.empty()
 
-    current_evaluation = app_state.get_card_evaluation(app_state.current_card_index)
+    current_evaluation = current_card.evaluation
     evaluation_emoji = get_evaluation_emoji(current_evaluation)
 
     # Card info
@@ -254,9 +233,9 @@ def get_card_display() -> CardDisplay:
     status = (
         f"**Status:** {evaluation_emoji} {current_evaluation.replace('_', ' ').title()}"
     )
-    topic = f"**Topic:** {current_card['topic']}"
-    question = f"**Question:** {current_card['question']}"
-    answer = f"**Answer:** {current_card['answer']}"
+    topic = f"**Topic:** {current_card.topic}"
+    question = f"**Question:** {current_card.question}"
+    answer = f"**Answer:** {current_card.answer}"
 
     # Button states
     prev_disabled = app_state.current_card_index == 0
@@ -279,7 +258,7 @@ def get_summary_display() -> str:
     if not app_state.cards:
         return "No cards to summarize"
 
-    counts = app_state.get_evaluation_counts()
+    counts = Counter(card.evaluation for card in app_state.cards)
     summary = f"""
     **Evaluation Summary:**
     - 👍 Liked: {counts['liked']}
@@ -290,50 +269,39 @@ def get_summary_display() -> str:
     return summary
 
 
+async def _update_current_card_evaluation(evaluation: str):
+    """Update the evaluation for a card"""
+    current_card = app_state.cards[app_state.current_card_index]
+    current_card.evaluation = evaluation
+    await app_state.db.asave_cards([current_card])
+
+
 async def mark_card_as_seen_if_needed():
     """Mark current card as seen if not evaluated"""
-    if app_state.cards and app_state.current_card_index < len(app_state.cards):
-        current_eval = app_state.get_card_evaluation(app_state.current_card_index)
-        if current_eval == "not_evaluated":
-            app_state.set_card_evaluation(app_state.current_card_index, "seen")
-            if app_state.document_key:
-                await app_state.db.aupdate_card_evaluation(
-                    app_state.document_key, app_state.current_card_index, "seen"
-                )
+    current_card = app_state.cards[app_state.current_card_index]
+    if current_card.evaluation == "not_evaluated":
+        await _update_current_card_evaluation("seen")
+
+
+async def _auto_advance_to_next_card():
+    """Auto-advance to next card"""
+    if app_state.current_card_index < len(app_state.cards) - 1:
+        app_state.current_card_index += 1
+        await mark_card_as_seen_if_needed()
+
+    return (*get_card_display(), get_summary_display())
 
 
 async def handle_like_card():
     """Handle like button click"""
-    await mark_card_as_seen_if_needed()
-    app_state.set_card_evaluation(app_state.current_card_index, "liked")
-
-    if app_state.document_key:
-        await app_state.db.aupdate_card_evaluation(
-            app_state.document_key, app_state.current_card_index, "liked"
-        )
-
-    # Auto-advance to next card
-    if app_state.current_card_index < len(app_state.cards) - 1:
-        app_state.current_card_index += 1
-
-    return (*get_card_display(), get_summary_display())
+    await _update_current_card_evaluation("liked")
+    return await _auto_advance_to_next_card()
 
 
 async def handle_dislike_card():
     """Handle dislike button click"""
-    await mark_card_as_seen_if_needed()
-    app_state.set_card_evaluation(app_state.current_card_index, "disliked")
-
-    if app_state.document_key:
-        await app_state.db.aupdate_card_evaluation(
-            app_state.document_key, app_state.current_card_index, "disliked"
-        )
-
-    # Auto-advance to next card
-    if app_state.current_card_index < len(app_state.cards) - 1:
-        app_state.current_card_index += 1
-
-    return (*get_card_display(), get_summary_display())
+    await _update_current_card_evaluation("disliked")
+    return await _auto_advance_to_next_card()
 
 
 async def handle_previous_card():
@@ -346,10 +314,7 @@ async def handle_previous_card():
 
 async def handle_next_card():
     """Handle next button click"""
-    if app_state.current_card_index < len(app_state.cards) - 1:
-        app_state.current_card_index += 1
-    await mark_card_as_seen_if_needed()
-    return (*get_card_display(), get_summary_display())
+    return await _auto_advance_to_next_card()
 
 
 async def handle_reset_cards():
@@ -359,9 +324,9 @@ async def handle_reset_cards():
     return (*get_card_display(), get_summary_display())
 
 
-def get_database_stats() -> str:
+async def get_database_stats() -> str:
     """Get database statistics"""
-    contexts = app_state.db.get_contexts()
+    contexts = await app_state.db.aget_contexts()
     if contexts:
         return f"**Database Statistics:**\n📁 Saved documents: {len(contexts)}"
     return "**Database Statistics:**\nNo documents saved yet."
@@ -369,8 +334,8 @@ def get_database_stats() -> str:
 
 def create_interface():
     """Create the Gradio interface"""
-    with gr.Blocks(title="GPT to Anki", theme=gr.themes.Soft()) as app:
-        gr.Markdown("# 🎯 GPT to Anki")
+    with gr.Blocks(title="NeuroNote", theme=gr.themes.Soft()) as app:
+        gr.Markdown("# 🎯 NeuroNote")
         gr.Markdown("Upload a document or enter a URL to generate flashcards!")
 
         with gr.Row():
@@ -428,17 +393,14 @@ def create_interface():
 
                 # Database stats
                 gr.Markdown("---")
-                db_stats = gr.Markdown(get_database_stats())
+                db_stats = gr.Markdown("Loading database stats...")
 
         # Event handlers
         async def process_document_handler(file_path, url):
-            # Mark current card as seen before processing
-            await mark_card_as_seen_if_needed()
-
             status_msg, card_info_msg = await process_document(file_path, url)
             card_display = get_card_display()
             summary = get_summary_display()
-            stats = get_database_stats()
+            stats = await get_database_stats()
 
             return (status_msg, card_info_msg, *card_display, summary, stats)
 

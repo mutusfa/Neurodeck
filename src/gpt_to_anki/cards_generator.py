@@ -1,4 +1,5 @@
 import dspy
+from gpt_to_anki.data_objects import Card
 
 lm = dspy.LM(model="gpt-4o-mini", temperature=0.7)
 dspy.configure(lm=lm)
@@ -25,11 +26,21 @@ class CardGenerator(dspy.Module):
     async def aforward(self, context: str) -> dspy.Prediction:
         result = await self.generate_cards.acall(context=context, temperature=0.3)
 
-        # Convert questions and answers lists to qa tuples
+        # Convert questions and answers lists to Card objects
         questions = result.questions if hasattr(result, "questions") else []
         answers = result.answers if hasattr(result, "answers") else []
         min_length = min(len(questions), len(answers))
-        qa_pairs = [(questions[i], answers[i]) for i in range(min_length)]
-        result.qa = qa_pairs
+
+        cards = [
+            Card(
+                question=questions[i],
+                answer=answers[i],
+                topic=result.topic,
+                context=context,
+            )
+            for i in range(min_length)
+        ]
+
+        result.cards = cards
 
         return result
