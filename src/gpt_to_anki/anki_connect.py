@@ -1,7 +1,7 @@
 import asyncio
 from typing import Dict, List, Optional
 
-import requests
+import aiohttp
 
 from gpt_to_anki.anki_base import AbstractAnkiDeck
 from gpt_to_anki.anki_models import AnkiNoteFeedback
@@ -25,29 +25,52 @@ class AnkiConnectDeck(AbstractAnkiDeck):
             "topic": "Topic",
         }
         self.endpoint = endpoint
+        self._session: Optional[aiohttp.ClientSession] = None
 
-    def _post(self, action: str, **params):
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        """Ensure we have an active aiohttp session."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self) -> None:
+        """Close the aiohttp session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def __aenter__(self):
+        """Async context manager support."""
+        await self._ensure_session()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager cleanup."""
+        await self.close()
+
+    async def _post(self, action: str, **params):
+        session = await self._ensure_session()
         payload = {"action": action, "version": 6, "params": params}
-        response = requests.post(self.endpoint, json=payload, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("error"):
-            raise RuntimeError(f"AnkiConnect error: {data['error']}")
-        return data.get("result")
+        
+        async with session.post(self.endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            response.raise_for_status()
+            data = await response.json()
+            if data.get("error"):
+                raise RuntimeError(f"AnkiConnect error: {data['error']}")
+            return data.get("result")
 
     def _build_search_for_id(self, db_id: int) -> str:
         # Restrict by deck, note type and match the id field
         return f'deck:"{self.deck_name}" note:"{self.model_name}" {self.id_field}:{db_id}'
 
-    def _fetch_single_feedback(self, db_id: int) -> Optional[AnkiNoteFeedback]:
+    async def _fetch_single_feedback(self, db_id: int) -> Optional[AnkiNoteFeedback]:
         query = self._build_search_for_id(db_id)
 
-        note_ids = self._post("findNotes", query=query) or []
+        note_ids = await self._post("findNotes", query=query) or []
         if not note_ids:
             return None
 
         # Take first note (should be unique by id field)
-        notes = self._post("notesInfo", notes=note_ids) or []
+        notes = await self._post("notesInfo", notes=note_ids) or []
         if not notes:
             return None
 
@@ -60,11 +83,11 @@ class AnkiConnectDeck(AbstractAnkiDeck):
             return value_obj.get("value", "")
 
         # Determine suspended/flag from cards
-        card_ids = self._post("findCards", query=query) or []
+        card_ids = await self._post("findCards", query=query) or []
         suspended = False
         flag = 0
         if card_ids:
-            cards = self._post("cardsInfo", cards=card_ids) or []
+            cards = await self._post("cardsInfo", cards=card_ids) or []
             for card in cards:
                 # Either explicit suspended, or queue == -1
                 if card.get("suspended") or card.get("queue") == -1:
@@ -76,7 +99,7 @@ class AnkiConnectDeck(AbstractAnkiDeck):
                 flag = max(flag, flag_value)
 
         return AnkiNoteFeedback(
-            id=db_id,
+            database_id=db_id,
             anki_note_id=note.get("noteId"),
             deck_name=self.deck_name,
             model_name=note.get("modelName", self.model_name),
@@ -90,6 +113,6 @@ class AnkiConnectDeck(AbstractAnkiDeck):
     async def aget_feedback_for_database_ids(
         self, database_ids: List[int]
     ) -> List[AnkiNoteFeedback]:
-        tasks = [asyncio.to_thread(self._fetch_single_feedback, db_id) for db_id in database_ids]
+        tasks = [self._fetch_single_feedback(db_id) for db_id in database_ids]
         results = await asyncio.gather(*tasks)
         return [r for r in results if r is not None]
