@@ -1,11 +1,12 @@
 import logging
 from typing import List
-from sqlalchemy import Column, Integer, String
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, func
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import select, delete
 
 from gpt_to_anki.data_objects import Card
+from gpt_to_anki.anki_models import AnkiNoteFeedback
 
 LOG = logging.getLogger(__name__)
 
@@ -21,6 +22,22 @@ class CardRecord(Base):
     evaluation = Column(String, default="not_evaluated")
     context = Column(String, nullable=False)
     topic = Column(String, nullable=False)
+
+
+class AnkiFeedbackRecord(Base):
+    __tablename__ = "anki_feedback"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    database_id = Column(Integer, unique=True, nullable=False, index=True)
+    anki_note_id = Column(Integer, nullable=False)
+    deck_name = Column(String, nullable=False)
+    model_name = Column(String, nullable=False)
+    question = Column(String, nullable=False)
+    answer = Column(String, nullable=False)
+    topic = Column(String, default="")
+    suspended = Column(Boolean, default=False, nullable=False)
+    flag = Column(Integer, default=0, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class CardDatabase:
@@ -147,7 +164,7 @@ class CardDatabase:
 
     async def aclear_all_cards(self):
         """Delete all cards from the database."""
-        await self.init_database()
+        await self.ainit_database()
 
         try:
             async with self.async_session() as session:
@@ -157,6 +174,71 @@ class CardDatabase:
                 LOG.info("Deleted all %d cards from database", result.rowcount)
         except Exception as e:
             LOG.error("Error clearing all cards: %s", e)
+
+    async def asave_anki_feedback(self, feedback_list: List[AnkiNoteFeedback]) -> None:
+        """Upsert Anki feedback for given cards using database_id as a unique key."""
+        if not feedback_list:
+            return
+
+        await self.ainit_database()
+        database_ids = [f.database_id for f in feedback_list]
+
+        try:
+            async with self.async_session() as session:
+                # Load existing rows
+                stmt = select(AnkiFeedbackRecord).where(
+                    AnkiFeedbackRecord.database_id.in_(database_ids)
+                )
+                result = await session.execute(stmt)
+                existing = {row.database_id: row for row in result.scalars().all()}
+
+                for fb in feedback_list:
+                    row = existing.get(fb.database_id)
+                    if row is None:
+                        row = AnkiFeedbackRecord(
+                            database_id=fb.database_id,
+                            anki_note_id=fb.anki_note_id,
+                            deck_name=fb.deck_name,
+                            model_name=fb.model_name,
+                            question=fb.question,
+                            answer=fb.answer,
+                            topic=fb.topic,
+                            suspended=fb.suspended,
+                            flag=fb.flag,
+                        )
+                        session.add(row)
+                    else:
+                        row.anki_note_id = fb.anki_note_id
+                        row.deck_name = fb.deck_name
+                        row.model_name = fb.model_name
+                        row.question = fb.question
+                        row.answer = fb.answer
+                        row.topic = fb.topic
+                        row.suspended = fb.suspended
+                        row.flag = fb.flag
+
+                await session.commit()
+        except Exception as e:
+            LOG.error("Error saving Anki feedback: %s", e)
+            raise
+
+    async def aload_anki_feedback(self, database_ids: List[int]) -> List[AnkiNoteFeedback]:
+        """Load Anki feedback rows for the given database ids."""
+        if not database_ids:
+            return []
+
+        await self.ainit_database()
+        try:
+            async with self.async_session() as session:
+                stmt = select(AnkiFeedbackRecord).where(
+                    AnkiFeedbackRecord.database_id.in_(database_ids)
+                )
+                result = await session.execute(stmt)
+                rows = result.scalars().all()
+                return [AnkiNoteFeedback.model_validate(r) for r in rows]
+        except Exception as e:
+            LOG.error("Error loading Anki feedback: %s", e)
+            return []
 
     async def aclose(self):
         """Close the database connection."""
