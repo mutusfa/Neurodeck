@@ -1,5 +1,6 @@
 """Integration tests for Anki feedback synchronization."""
 import pytest
+import pytest_asyncio
 import tempfile
 import os
 from unittest.mock import patch, AsyncMock
@@ -12,7 +13,7 @@ from gpt_to_anki.anki_models import AnkiNoteFeedback
 class TestAnkiSyncIntegration:
     """Integration test suite for Anki feedback synchronization."""
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def db(self):
         """Create a temporary database for testing."""
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:

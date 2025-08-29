@@ -1,8 +1,9 @@
 """Unit tests for anki_feedback database operations."""
 import pytest
+import pytest_asyncio
 import tempfile
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from gpt_to_anki.database import CardDatabase, AnkiFeedbackRecord
 from gpt_to_anki.anki_models import AnkiNoteFeedback
@@ -11,7 +12,7 @@ from gpt_to_anki.anki_models import AnkiNoteFeedback
 class TestAnkiFeedbackDatabaseOperations:
     """Test suite for anki_feedback database operations."""
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def db(self):
         """Create a temporary database for testing."""
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
@@ -252,7 +253,7 @@ class TestAnkiFeedbackDatabaseOperations:
         )
         
         # Save and check timestamp
-        before_save = datetime.utcnow()
+        before_save = datetime.now(timezone.utc)
         await db.asave_anki_feedback([feedback])
         
         # Query directly to check timestamp
@@ -263,4 +264,8 @@ class TestAnkiFeedbackDatabaseOperations:
             record = result.scalar_one()
             
             assert record.updated_at is not None
-            assert record.updated_at >= before_save
+            # Convert naive datetime to UTC for comparison and allow for precision loss
+            record_utc = record.updated_at.replace(tzinfo=timezone.utc)
+            # Allow for up to 1 second difference due to database timestamp precision
+            time_diff = abs((record_utc - before_save).total_seconds())
+            assert time_diff < 1.0, f"Timestamp difference too large: {time_diff}s"
